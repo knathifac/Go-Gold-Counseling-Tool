@@ -1,0 +1,69 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { CreateWebWorkerMLCEngine, type WebWorkerMLCEngine } from '@mlc-ai/web-llm';
+import { messages, validateInput, validateReport, validationFailure, MAX_BYTES, type Submission, type Report } from './evaluation';
+import { scenarios } from './scenarios';
+import { rubric } from './rubric';
+import './style.css';
+const MODEL='Qwen2.5-1.5B-Instruct-q4f32_1-MLC';
+const empty:Submission={...scenarios[0].input,transcript:'',speaker:'',counselor:'',counselee:'',context:''};
+function safeFailure(error:unknown){
+ const text=String(error);
+ if(text.includes('Generation was incomplete'))return 'Generation reached its output limit. No partial report is shown. Try a shorter excerpt.';
+ if(text.startsWith('Error: Output failed'))return (error as Error).message;
+ const codes=['ContextWindowSizeExceededError','DeviceLostError','WorkerEngineModelNotLoadedError','ModelNotLoadedError','GrammarMatcherInitError','InvalidResponseFormatError','WindowSizeConfigurationError','UnsupportedFieldsError'];
+ const code=codes.find(c=>text.includes(c));
+ return `Analysis failed${code ? ' ('+code+')' : ''}. Reload the model and try a shorter excerpt; close GPU-heavy tabs if memory is limited. No report was fabricated.`;
+}
+function App(){
+ const [input,setInput]=useState<Submission>(empty),[report,setReport]=useState<Report|null>(null);
+ const [device,setDevice]=useState('Checking secure context and WebGPU…'),[supported,setSupported]=useState(false);
+ const [phase,setPhase]=useState<'idle'|'loading'|'ready'|'running'>('idle');
+ const [testing,setTesting]=useState(false),[suite,setSuite]=useState<{name:string;outcome:string}[]>([]);
+ const [progress,setProgress]=useState(0),[status,setStatus]=useState('Model not loaded.'),[error,setError]=useState('');
+ const engine=useRef<WebWorkerMLCEngine|null>(null),worker=useRef<Worker|null>(null),epoch=useRef(0);
+ useEffect(()=>{let active=true; void(async()=>{try{
+  if(!window.isSecureContext)throw Error('Secure context required. Open on HTTPS or localhost.');
+  const gpu=(navigator as Navigator & {gpu?:{requestAdapter:()=>Promise<unknown>}}).gpu;
+  if(!gpu)throw Error('WebGPU is unavailable in this browser. Try a current desktop Chrome or Edge with GPU acceleration.');
+  if(!await gpu.requestAdapter())throw Error('No GPU adapter is available. Check browser graphics support or try another device.');
+  if(active){setSupported(true);setDevice('Secure context ✓ · WebGPU ✓ · GPU adapter ✓');}
+ }catch(e){if(active)setDevice((e as Error).message);}})();return()=>{active=false;worker.current?.terminate();};},[]);
+ function discard(message='Session cleared. Model must be reloaded; cached downloads remain.'){
+  epoch.current++; setTesting(false); worker.current?.terminate();worker.current=null;engine.current=null;setPhase('idle');setProgress(0);setStatus(message);setReport(null);setError('');
+ }
+ async function load(){const run=++epoch.current;setError('');setPhase('loading');setProgress(0);setStatus('Starting local model download…');
+  try{worker.current=new Worker(new URL('./worker.ts',import.meta.url),{type:'module'});
+   worker.current.onerror=()=>{if(run===epoch.current){discard('Worker stopped.');setError('Local AI worker failed. Reload the model; if this repeats, try another supported device.');}};
+   const loaded=await CreateWebWorkerMLCEngine(worker.current,MODEL,{logLevel:'SILENT',initProgressCallback:p=>{if(run===epoch.current){setProgress(p.progress);setStatus(p.text);}}},{context_window_size:16384});
+   if(run!==epoch.current)return;engine.current=loaded;setPhase('ready');setStatus('Local AI ready. Quality has not yet been established.');
+  }catch{if(run!==epoch.current)return;discard('Model not loaded.');setError('Model loading failed. Check internet access and available storage; close GPU-heavy tabs if memory is limited, then retry. No transcript was sent.');}}
+ async function analyze(submission:Submission=input){setError('');setReport(null);let snapshot:Submission;try{snapshot=validateInput(submission);}catch(e){setError((e as Error).message);return;}
+  if(!engine.current)return;const run=epoch.current;setPhase('running');setStatus('Generating locally…');
+  try{await engine.current.resetChat();const output=await engine.current.chat.completions.create({messages:messages(snapshot),temperature:0.1,max_tokens:3600});
+   if(run!==epoch.current)return;
+   if(output.choices[0]?.finish_reason!=='stop')throw Error('Generation was incomplete. Try a shorter excerpt.');
+   let checked:Report;try{checked=validateReport(output.choices[0]?.message.content??'',snapshot);}catch(e){throw Error('Output failed: '+validationFailure(e)+' No report is shown. Retry or shorten the excerpt; repeated failures mean this model is not ready.');}
+   await engine.current.resetChat();if(run!==epoch.current)return;setReport(checked);setPhase('ready');setStatus('Generated by local AI. Exact evidence checked; review interpretation yourself.');return 'Validated report — human quality review still required.';
+  }catch(e){if(run!==epoch.current)return;const reason=safeFailure(e);
+   if(String(e).startsWith('Error: Output failed')||String(e).includes('Generation was incomplete')){
+    try{await engine.current?.resetChat();}catch{discard('Model released after failed reset.');}
+    if(run!==epoch.current)return;setPhase('ready');setStatus('Model ready; previous output was rejected.');
+   }else discard('Model released after failed analysis.');
+   setError(reason);return reason;}}
+ async function testAll(){const run=epoch.current;setTesting(true);setSuite([]);
+  try{for(const scenario of scenarios){if(run!==epoch.current||!engine.current)break;setInput({...scenario.input});const outcome=await analyze(scenario.input);if(run!==epoch.current)break;setSuite(previous=>[...previous,{name:scenario.name,outcome:outcome??'No result.'}]);}}finally{setTesting(false);}}
+
+ function update(key:keyof Submission,value:string){setInput({...input,[key]:value});setReport(null);setError('');}
+ const busy=testing||phase==='loading'||phase==='running';
+ return <><header><span className="brand">G<span>G</span></span><div><strong>GO GOLD</strong><small>Counseling practice lab</small></div><span className="badge">STAGE 1 · FEASIBILITY PILOT</span></header><main>
+ <section className="intro"><p className="eyebrow">REFLECT. PRACTICE. DEVELOP.</p><h1>Better conversations.<br/><em>Stronger leaders.</em></h1><p>Test local AI feedback on fictional counseling conversations for Vanderbilt Army ROTC cadets.</p><p className="notice">Development practice only. No official grading or Army / Vanderbilt endorsement. Initial five-case test: 0/5 outputs passed validation. This pilot is not ready for counseling use; Stage 2 is deferred.</p></section>
+ <section className="panel"><h2><span>01</span> Prepare local AI</h2><p role="status">{device}</p><p><strong>Qwen2.5 · 1.5B · 4-bit / float32</strong><br/>Budget roughly 1–1.5 GB of downloads and 3–4 GB of available memory including browser overhead. Actual use varies; GPU detection does not guarantee successful loading.</p><div className="actions"><button onClick={load} disabled={!supported||phase!=='idle'}>Load local AI</button>{busy&&<button className="secondary" onClick={()=>discard('Stopped. Partial output discarded. Reload AI to try again.')}>Stop {phase==='loading'?'loading':'generation'}</button>}</div>{phase==='loading'&&<progress aria-label="Model loading" value={progress} max={1}/>}<p role="status" className="muted">{status}</p><details><summary>What stays on this device?</summary><p>Transcripts and feedback stay in memory. Model and runtime files download from external hosts and may remain in browser caches. Clear session terminates the worker and removes this session’s text/results; it does not erase cached model files. Remove site data in browser settings to remove those files. No accounts, analytics or transcript database.</p></details></section>
+ <section className="panel"><h2><span>02</span> Try a conversation</h2><p>Use fictional content during feasibility testing. Label every nonempty line <code>Speaker: text</code>, including each email paragraph, so evidence can be checked against its author.</p><div className="samples">{scenarios.map(s=><button className="secondary" disabled={busy} key={s.name} onClick={()=>{setInput({...s.input});setReport(null);setError('');}}>{s.name}</button>)}</div>
+ <fieldset disabled={busy}><div className="grid"><label>Counseling type<select value={input.type} onChange={e=>update('type',e.target.value)}><option value="mentorship">Mentorship</option><option value="rotation">Leader development / rotation</option><option value="performance">Performance / spot report</option></select></label><label>Evaluate this speaker<input value={input.speaker} onChange={e=>update('speaker',e.target.value)} placeholder="Exact line label, e.g. Alex" maxLength={80}/></label><label>Counselor role / MS level<input value={input.counselor} onChange={e=>update('counselor',e.target.value)} maxLength={100}/></label><label>Counselee role / MS level<input value={input.counselee} onChange={e=>update('counselee',e.target.value)} maxLength={100}/></label><label>Format<select value={input.medium} onChange={e=>update('medium',e.target.value)}><option value="transcript">Written transcript</option><option value="email">Email exchange</option></select></label><label>Coverage<select value={input.completeness} onChange={e=>update('completeness',e.target.value)}><option value="complete">Complete submission</option><option value="excerpt">Excerpt / incomplete exchange</option></select></label></div>
+ <label>Conversation<textarea rows={12} value={input.transcript} onChange={e=>update('transcript',e.target.value)} placeholder={'Alex: What would you like to work on?\nJordan: …'}/></label><label>Optional context<textarea rows={2} value={input.context} maxLength={500} onChange={e=>update('context',e.target.value)}/></label><p className="muted">{new TextEncoder().encode(JSON.stringify(input)).length} / {MAX_BYTES} UTF-8 bytes, including labels, roles and context. Oversized submissions are rejected, never truncated.</p></fieldset>
+ <div className="actions"><button disabled={phase!=='ready'||testing} onClick={()=>void analyze()}>Analyze locally</button><button className="secondary" disabled={phase!=='ready'||testing} onClick={testAll}>Run five feasibility cases</button><button className="secondary" onClick={()=>{discard();setInput({...empty});setSuite([]);}}>Clear session</button></div>{error&&<p className="error" role="alert">{error}</p>}</section>
+ {suite.length>0&&<section className="panel"><h2>Feasibility run · {suite.length} / 5</h2><p>Validation outcomes only, not counseling feedback or a quality pass.</p><ul>{suite.map(row=><li key={row.name}><strong>{row.name}:</strong> {row.outcome}</li>)}</ul></section>}<section className="panel" aria-live="polite"><h2><span>03</span> Review the evidence</h2>{!report?<p className="muted">Your validated, model-generated feedback will appear here. No sample results or automated keyword scores.</p>:<><p className="badge">LOCAL AI · REVIEW REQUIRED</p><h3>Overall assessment · {report.speaker}</h3><p>{report.overall}</p>{(['strengths','improvements','checks'] as const).map(group=><section key={group}><h3>{group==='checks'?'OARS, doctrine & unit checks':group==='strengths'?'Strengths':'Priority improvements'}</h3>{report[group].length===0&&<p>Insufficient evidence.</p>}{report[group].map((item,i)=><article key={i}><strong>{item.criterion} · {item.status}</strong>{item.quote&&<blockquote>{item.quote}</blockquote>}<p>{item.explanation}</p>{item.suggestion&&<p><strong>Suggested alternative:</strong> {item.suggestion}</p>}<small>{rubric.find(r=>r.id===item.criterion)?.source}</small></article>)}</section>)}<h3>Next-session practice</h3><ol>{report.priorities.map((p,i)=><li key={i}>{p}</li>)}</ol></>}</section>
+ <footer>Go Gold practice lab · Local inference · Pilot, not an official assessment</footer></main></>;
+}
+createRoot(document.getElementById('root')!).render(<App/>);
